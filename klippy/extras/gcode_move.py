@@ -158,25 +158,33 @@ class GCodeMove:
 
     def _move_with_rotation(self, position, speed):
         # Do not mutate GCodeMove.last_position: it remains in work coordinates.
-        self.move_with_transform(self._rotate_position(position), speed)
+        self.move_with_transform(
+            self._rotate_position(position), speed
+        )
 
     def cmd_G68(self, gcmd):
         # G68 X<centre-x> Y<centre-y> R<degrees>
         x = gcmd.get_float("X", None)
         y = gcmd.get_float("Y", None)
         angle = gcmd.get_float("R", None)
+        if not self.is_printer_ready:
+            raise gcmd.error("G68 requires the printer to be ready")
         if x is None or y is None or angle is None:
             raise gcmd.error("G68 requires X, Y and R parameters")
         if not all(math.isfinite(v) for v in (x, y, angle)):
             raise gcmd.error("G68 parameters must be finite numbers")
         # Store the pivot in the underlying, unrotated coordinate frame.
         center = (x + self.base_position[0], y + self.base_position[1])
+        if not all(math.isfinite(v) for v in center):
+            raise gcmd.error("G68 centre is outside the supported numeric range")
         # Reconfigure without moving the physical toolhead. Re-read the
         # position in the underlying transform's coordinate frame.
         current_position = self.position_with_transform()
         self.rotation_center = center
         self.rotation_angle = math.radians(angle % 360.0)
-        logical_position = self._rotate_position(current_position, inverse=True)
+        logical_position = self._rotate_position(
+            current_position, inverse=True
+        )
         self.last_position[:2] = logical_position[:2]
 
     def cmd_G69(self, gcmd):
@@ -381,7 +389,9 @@ class GCodeMove:
         self.extrude_factor = state["extrude_factor"]
         self.rotation_angle = state.get("rotation_angle", 0.0)
         saved_center = state.get("rotation_center")
-        self.rotation_center = None if saved_center is None else tuple(saved_center)
+        self.rotation_center = (
+            None if saved_center is None else tuple(saved_center)
+        )
         self.last_position = current_last_position
         self.last_position[:2] = self._rotate_position(
             current_position, inverse=True
