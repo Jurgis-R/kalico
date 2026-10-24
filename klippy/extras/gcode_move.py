@@ -158,9 +158,9 @@ class GCodeMove:
 
     def _move_with_rotation(self, position, speed):
         # Do not mutate GCodeMove.last_position: it remains in work coordinates.
-        self.move_with_transform(
-            self._rotate_position(position), speed
-        )
+        self.move_with_transform(self._rotate_position(position), speed)
+
+    cmd_G68_help = "Rotate subsequent XY coordinates about a specified centre"
 
     def cmd_G68(self, gcmd):
         # G68 X<centre-x> Y<centre-y> R<degrees>
@@ -186,6 +186,8 @@ class GCodeMove:
             current_position, inverse=True
         )
         self.last_position[:2] = logical_position[:2]
+
+    cmd_G69_help = "Cancel G68 XY coordinate rotation"
 
     def cmd_G69(self, gcmd):
         # Cancel rotation while keeping the physical toolhead stationary.
