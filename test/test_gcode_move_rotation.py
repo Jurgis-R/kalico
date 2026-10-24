@@ -18,6 +18,7 @@ class FakeGCodeCommand:
 
 def make_move():
     move = GCodeMove.__new__(GCodeMove)
+    move.is_printer_ready = True
     move.base_position = [0.0, 0.0, 0.0, 0.0]
     move.last_position = [110.0, 75.0, 3.0, 0.0]
     move.rotation_angle = 0.0
