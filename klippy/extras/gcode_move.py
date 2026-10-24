@@ -4,6 +4,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
+import math
 
 
 class GCodeMove:
@@ -14,6 +15,8 @@ class GCodeMove:
         gcode = printer.lookup_object("gcode")
         handlers = [
             "G1",
+            "G68",
+            "G69",
             "G20",
             "G21",
             "M82",
@@ -49,6 +52,10 @@ class GCodeMove:
         self.speed = 25.0
         self.speed_factor = 1.0 / 60.0
         self.extrude_factor = 1.0
+        # CNC work-coordinate rotation (G68/G69), applied before other
+        # move transforms such as bed mesh.
+        self.rotation_angle = 0.0  # radians, positive counter-clockwise
+        self.rotation_center = None  # center in unrotated machine coordinates
         # G-Code state
         self.saved_states = {}
         self.move_transform = self.move_with_transform = None
@@ -93,12 +100,15 @@ class GCodeMove:
         logging.info(
             "gcode state: absolute_coord=%s absolute_extrude=%s"
             " base_position=%s last_position=%s homing_position=%s"
+            " rotation_angle=%s rotation_center=%s"
             " speed_factor=%s extrude_factor=%s speed=%s",
             self.absolute_coord,
             self.absolute_extrude,
             self.base_position,
             self.last_position,
             self.homing_position,
+            self.rotation_angle,
+            self.rotation_center,
             self.speed_factor,
             self.extrude_factor,
             self.speed,
@@ -110,6 +120,10 @@ class GCodeMove:
         self.base_position[3] = self.last_position[3]
 
     def _handle_home_rails_end(self, homing_state, rails):
+        # Homing uses machine coordinates directly; cancel work rotation so
+        # it cannot leave a stale pivot/frame after an axis is re-homed.
+        self.rotation_angle = 0.0
+        self.rotation_center = None
         self.reset_last_position()
         for axis in homing_state.get_axes():
             self.base_position[axis] = self.homing_position[axis]
@@ -126,6 +140,53 @@ class GCodeMove:
         self.move_with_transform = transform.move
         self.position_with_transform = transform.get_position
         return old_transform
+
+    def _rotate_position(self, position, inverse=False):
+        # Transform only XY; preserve Z, extrusion, and any additional axes.
+        result = list(position)
+        if self.rotation_center is None or self.rotation_angle == 0.0:
+            return result
+        cx, cy = self.rotation_center
+        angle = -self.rotation_angle if inverse else self.rotation_angle
+        cos_a = math.cos(angle)
+        sin_a = math.sin(angle)
+        dx = position[0] - cx
+        dy = position[1] - cy
+        result[0] = cx + cos_a * dx - sin_a * dy
+        result[1] = cy + sin_a * dx + cos_a * dy
+        return result
+
+    def _move_with_rotation(self, position, speed):
+        # Do not mutate GCodeMove.last_position: it remains in work coordinates.
+        self.move_with_transform(self._rotate_position(position), speed)
+
+    def cmd_G68(self, gcmd):
+        # G68 X<centre-x> Y<centre-y> R<degrees>
+        x = gcmd.get_float("X", None)
+        y = gcmd.get_float("Y", None)
+        angle = gcmd.get_float("R", None)
+        if x is None or y is None or angle is None:
+            raise gcmd.error("G68 requires X, Y and R parameters")
+        if not all(math.isfinite(v) for v in (x, y, angle)):
+            raise gcmd.error("G68 parameters must be finite numbers")
+        # Store the pivot in the underlying, unrotated coordinate frame.
+        center = (x + self.base_position[0], y + self.base_position[1])
+        # Reconfigure without moving the physical toolhead. Re-read the
+        # position in the underlying transform's coordinate frame.
+        current_position = self.position_with_transform()
+        self.rotation_center = center
+        self.rotation_angle = math.radians(angle % 360.0)
+        logical_position = self._rotate_position(current_position, inverse=True)
+        self.last_position[:2] = logical_position[:2]
+
+    def cmd_G69(self, gcmd):
+        # Cancel rotation while keeping the physical toolhead stationary.
+        if self.rotation_center is None:
+            return
+        current_position = self.position_with_transform()
+        self.rotation_center = None
+        self.rotation_angle = 0.0
+        self.last_position[:2] = current_position[:2]
 
     def _get_gcode_position(self):
         p = [lp - bp for lp, bp in zip(self.last_position, self.base_position)]
@@ -153,7 +214,9 @@ class GCodeMove:
 
     def reset_last_position(self):
         if self.is_printer_ready:
-            self.last_position = self.position_with_transform()
+            self.last_position = self._rotate_position(
+                self.position_with_transform(), inverse=True
+            )
 
     def _update_extra_axes(self):
         toolhead = self.printer.lookup_object("toolhead")
@@ -200,7 +263,7 @@ class GCodeMove:
             raise gcmd.error(
                 "Unable to parse move '%s'" % (gcmd.get_commandline(),)
             )
-        self.move_with_transform(self.last_position, self.speed)
+        self._move_with_rotation(self.last_position, self.speed)
 
     # G-Code coordinate manipulation
     def cmd_G20(self, gcmd):
@@ -277,7 +340,7 @@ class GCodeMove:
             speed = gcmd.get_float("MOVE_SPEED", self.speed, above=0.0)
             for pos, delta in enumerate(move_delta):
                 self.last_position[pos] += delta
-            self.move_with_transform(self.last_position, speed)
+            self._move_with_rotation(self.last_position, speed)
 
     cmd_SAVE_GCODE_STATE_help = "Save G-Code coordinate state"
 
@@ -292,6 +355,10 @@ class GCodeMove:
             "speed": self.speed,
             "speed_factor": self.speed_factor,
             "extrude_factor": self.extrude_factor,
+            "rotation_angle": self.rotation_angle,
+            "rotation_center": (
+                None if self.rotation_center is None else list(self.rotation_center)
+            ),
         }
 
     cmd_RESTORE_GCODE_STATE_help = "Restore a previously saved G-Code state"
@@ -301,6 +368,9 @@ class GCodeMove:
         state = self.saved_states.get(state_name)
         if state is None:
             raise gcmd.error("Unknown g-code state: %s" % (state_name,))
+        # Keep the physical XY position stationary while restoring the frame.
+        current_last_position = list(self.last_position)
+        current_position = self.position_with_transform()
         # Restore state
         self.absolute_coord = state["absolute_coord"]
         self.absolute_extrude = state["absolute_extrude"]
@@ -309,14 +379,21 @@ class GCodeMove:
         self.speed = state["speed"]
         self.speed_factor = state["speed_factor"]
         self.extrude_factor = state["extrude_factor"]
+        self.rotation_angle = state.get("rotation_angle", 0.0)
+        saved_center = state.get("rotation_center")
+        self.rotation_center = None if saved_center is None else tuple(saved_center)
+        self.last_position = current_last_position
+        self.last_position[:2] = self._rotate_position(
+            current_position, inverse=True
+        )[:2]
         # Restore the relative E position
-        e_diff = self.last_position[3] - state["last_position"][3]
+        e_diff = current_last_position[3] - state["last_position"][3]
         self.base_position[3] += e_diff
         # Move the toolhead back if requested
         if gcmd.get_int("MOVE", 0):
             speed = gcmd.get_float("MOVE_SPEED", self.speed, above=0.0)
             self.last_position[:3] = state["last_position"][:3]
-            self.move_with_transform(self.last_position, speed)
+            self._move_with_rotation(self.last_position, speed)
 
     cmd_GET_POSITION_help = (
         "Return information on the current location of the toolhead"
