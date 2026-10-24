@@ -124,6 +124,10 @@ class GCodeMove:
         # it cannot leave a stale pivot/frame after an axis is re-homed.
         self.rotation_angle = 0.0
         self.rotation_center = None
+        # A saved frame tied to the pre-home coordinate system is stale too.
+        for state in self.saved_states.values():
+            state["rotation_angle"] = 0.0
+            state["rotation_center"] = None
         self.reset_last_position()
         for axis in homing_state.get_axes():
             self.base_position[axis] = self.homing_position[axis]
@@ -220,6 +224,21 @@ class GCodeMove:
             "homing_origin": self.Coord(*self.homing_position[:4]),
             "position": self.Coord(*self.last_position[:4]),
             "gcode_position": self.Coord(*move_position),
+            "coordinate_rotation": {
+                "enabled": (
+                    self.rotation_center is not None
+                    and self.rotation_angle != 0.0
+                ),
+                "angle": math.degrees(self.rotation_angle),
+                "center": (
+                    None
+                    if self.rotation_center is None
+                    else self.Coord(
+                        self.rotation_center[0] - self.base_position[0],
+                        self.rotation_center[1] - self.base_position[1],
+                    )
+                ),
+            },
         }
 
     def reset_last_position(self):
