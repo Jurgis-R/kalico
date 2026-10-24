@@ -233,10 +233,10 @@ class GCodeMove:
                 "center": (
                     None
                     if self.rotation_center is None
-                    else self.Coord(
+                    else [
                         self.rotation_center[0] - self.base_position[0],
                         self.rotation_center[1] - self.base_position[1],
-                    )
+                    ]
                 ),
             },
         }
